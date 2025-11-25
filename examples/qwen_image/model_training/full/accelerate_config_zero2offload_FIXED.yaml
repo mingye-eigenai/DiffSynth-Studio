@@ -1,9 +1,11 @@
 compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
-  gradient_accumulation_steps: 8
-  offload_optimizer_device: none
-  offload_param_device: none
+  gradient_accumulation_steps: 1
+  train_batch_size: "auto"
+  train_micro_batch_size_per_gpu: 1
+  offload_optimizer_device: 'cpu'
+  offload_param_device: 'cpu'
   zero3_init_flag: false
   zero_stage: 2
 distributed_type: DEEPSPEED
@@ -20,3 +22,4 @@ tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
 use_cpu: false
+

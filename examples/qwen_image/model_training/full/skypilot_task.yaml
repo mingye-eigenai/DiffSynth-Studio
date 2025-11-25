@@ -1,0 +1,66 @@
+name: qwen-image-edit-8nodes
+
+# Resource configuration
+resources:
+  cloud: kubernetes  # or aws, gcp, azure depending on your setup
+  accelerators: A100:8  # 8 GPUs per node
+  
+# Number of nodes
+num_nodes: 8
+
+# File mounts - sync your code and data
+file_mounts:
+  /home/kuan/workspace/repos/DiffSynth-Studio:
+    source: .
+    mode: COPY
+  # Optionally mount your data if it's separate
+  # /data:
+  #   source: ~/data
+  #   mode: COPY
+
+# Environment setup
+setup: |
+  # Install dependencies
+  conda activate diffsynth || true
+  pip install -q accelerate deepspeed transformers diffusers torch torchvision
+
+# Working directory
+workdir: /home/kuan/workspace/repos/DiffSynth-Studio
+
+# The actual training command
+run: |
+  cd /home/kuan/workspace/repos/DiffSynth-Studio
+  
+  # Get the machine rank from SKYPILOT_NODE_RANK
+  # SkyPilot automatically sets this environment variable
+  MACHINE_RANK=${SKYPILOT_NODE_RANK:-0}
+  MAIN_IP=${SKYPILOT_NODE_IPS[0]}  # First node is always the main
+  
+  echo "Starting training on node ${MACHINE_RANK}/8"
+  echo "Main process IP: ${MAIN_IP}"
+  
+  accelerate launch \
+    --config_file examples/qwen_image/model_training/full/accelerate_config_8nodes.yaml \
+    --machine_rank ${MACHINE_RANK} \
+    --main_process_ip ${MAIN_IP} \
+    --main_process_port 29500 \
+    --num_machines 8 \
+    --num_processes 64 \
+    examples/qwen_image/model_training/train.py \
+    --dataset_base_path data/ \
+    --dataset_metadata_path /home/kuan/workspace/repos/DiffSynth-Studio/data/pico-banana-400k/openimages/metadata_sft_clean.csv \
+    --data_file_keys "image,edit_image" \
+    --extra_inputs "edit_image" \
+    --max_pixels 1048576 \
+    --dataset_repeat 1 \
+    --model_id_with_origin_paths "Qwen/Qwen-Image-Edit:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors" \
+    --learning_rate 1e-5 \
+    --num_epochs 5 \
+    --remove_prefix_in_ckpt "pipe.dit." \
+    --output_path "./models/train/Qwen-Image-Edit-Pico_8nodes" \
+    --trainable_models "dit" \
+    --use_gradient_checkpointing \
+    --dataset_num_workers 8 \
+    --find_unused_parameters \
+    --save_steps 10000
+

@@ -796,7 +796,7 @@ def model_fn_qwen_image(
     **kwargs
 ):
     img_shapes = [(latents.shape[0], latents.shape[2]//2, latents.shape[3]//2)]
-    txt_seq_lens = prompt_emb_mask.sum(dim=1).tolist()
+    txt_seq_lens = prompt_emb_mask.sum(dim=1).tolist() if prompt_emb_mask is not None else None
     timestep = timestep / 1000
     
     image = rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)

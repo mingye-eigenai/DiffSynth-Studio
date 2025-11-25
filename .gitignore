@@ -1,0 +1,48 @@
+# Model checkpoints and weights
+*.safetensors
+*.ckpt
+*.pth
+*.bin
+*.pt
+examples/qwen_image/model_training/lora/models/Qwen/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv
+env/
+venv/
+.deepspeed_env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# GitHub workflows (exclude due to token scope)
+.github/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training outputs
+*.log
+wandb/
+lightning_logs/
+
+# Temporary files
+*.tmp
+*._____temp/

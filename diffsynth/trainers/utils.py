@@ -542,14 +542,93 @@ def launch_training_task(
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    
+    # Create accelerator first to get process info
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
+    
+    # Use batch_size=1 and shuffle=True with seed based on process rank
+    # This ensures different data ordering per process/node
+    import random
+    import numpy as np
+    
+    # Set different random seed for each process to ensure data diversity
+    seed = 42 + accelerator.process_index
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    
+    # Create DataLoader with shuffle=True
+    # accelerator.prepare() will automatically handle distributed sampling
+    dataloader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=1, 
+        shuffle=True,
+        collate_fn=lambda x: x[0], 
+        num_workers=num_workers
+    )
+    
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     
+    # Debug: Print distributed data loading info
+    print(f"\n{'='*60}")
+    print(f"Process {accelerator.process_index}/{accelerator.num_processes} - Distributed Training Setup:")
+    print(f"  Local rank: {accelerator.local_process_index}")
+    print(f"  Random seed: {seed}")
+    print(f"  Total processes: {accelerator.num_processes}")
+    print(f"  Dataset size: {len(dataset)}")
+    print(f"  Steps per epoch: {len(dataloader)}")
+    
+    if accelerator.is_main_process:
+        print(f"  Expected (distributed): {len(dataset) // accelerator.num_processes}")
+        
+        # Check sampler type
+        sampler_type = type(dataloader.sampler).__name__
+        print(f"  Sampler type: {sampler_type}")
+        if hasattr(dataloader.sampler, 'shuffle'):
+            print(f"  Sampler shuffle: {dataloader.sampler.shuffle}")
+        if hasattr(dataloader.sampler, 'num_replicas'):
+            print(f"  Sampler num_replicas: {dataloader.sampler.num_replicas}")
+        if hasattr(dataloader.sampler, 'rank'):
+            print(f"  Sampler rank: {dataloader.sampler.rank}")
+    
+    # Test inter-node communication with all_reduce
+    test_tensor = torch.tensor([float(accelerator.process_index)]).to(accelerator.device)
+    original_value = test_tensor.item()
+    
+    # Synchronize all processes before test
+    accelerator.wait_for_everyone()
+    
+    # All-reduce: sum across all processes
+    import torch.distributed as dist
+    if accelerator.num_processes > 1:
+        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+    
+    expected_sum = sum(range(accelerator.num_processes))  # 0+1+2+...+(n-1)
+    actual_sum = test_tensor.item()
+    
+    if accelerator.is_main_process:
+        print(f"\n  🔍 Communication Test (all_reduce):")
+        print(f"     Expected sum: {expected_sum} (sum of all process indices)")
+        print(f"     Actual sum: {actual_sum}")
+        if abs(actual_sum - expected_sum) < 0.1:
+            print(f"     ✅ Multi-node communication is WORKING!")
+        else:
+            print(f"     ❌ Multi-node communication FAILED - nodes are isolated!")
+        
+        # Final verdict on data distribution
+        if len(dataloader) == len(dataset):
+            print(f"\n  ⚠️  WARNING: Data is NOT being distributed!")
+        else:
+            print(f"\n  ✅ Data is properly distributed across processes")
+    
+    print(f"{'='*60}\n")
+    accelerator.wait_for_everyone()
+    
     for epoch_id in range(num_epochs):
+        step_count = 0
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
@@ -558,9 +637,27 @@ def launch_training_task(
                 else:
                     loss = model(data)
                 accelerator.backward(loss)
+                
+                # Periodically verify gradient synchronization (every 100 steps)
+                if step_count % 100 == 0 and accelerator.num_processes > 1:
+                    # Get first parameter's gradient
+                    first_param = next(model.parameters())
+                    if first_param.grad is not None:
+                        grad_norm = first_param.grad.norm().item()
+                        grad_sum_tensor = torch.tensor([grad_norm]).to(accelerator.device)
+                        
+                        # All-reduce to check if gradients differ across processes
+                        import torch.distributed as dist
+                        dist.all_reduce(grad_sum_tensor, op=dist.ReduceOp.SUM)
+                        avg_grad_norm = grad_sum_tensor.item() / accelerator.num_processes
+                        
+                        if accelerator.is_main_process and step_count % 500 == 0:
+                            print(f"\n  [Step {step_count}] Gradient sync check: local={grad_norm:.6f}, avg={avg_grad_norm:.6f}")
+                
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                step_count += 1
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
@@ -679,6 +776,7 @@ def qwen_image_parser():
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
     parser.add_argument("--lora_rank", type=int, default=32, help="Rank of LoRA.")
     parser.add_argument("--lora_checkpoint", type=str, default=None, help="Path to the LoRA checkpoint. If provided, LoRA will be loaded from this checkpoint.")
+    parser.add_argument("--lora_fused", type=str, default=None, help="Path to a pretrained LoRA to fuse into base weights before training new LoRA.")
     parser.add_argument("--extra_inputs", default=None, help="Additional model inputs, comma-separated.")
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")

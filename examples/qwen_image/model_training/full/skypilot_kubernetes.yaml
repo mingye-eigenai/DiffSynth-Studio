@@ -1,0 +1,68 @@
+name: qwen-image-edit-8nodes-k8s
+
+# For Kubernetes environment (like nunchaku)
+resources:
+  cloud: kubernetes
+  accelerators: A100:8  # or your GPU type
+  cpus: 32+
+  memory: 256+
+  
+num_nodes: 8
+
+# File mounts
+file_mounts:
+  ~/sky_workdir:
+    source: .
+    mode: COPY
+
+# Environment setup
+setup: |
+  # Activate your environment
+  source ~/.bashrc
+  # Add any conda/pip installations needed
+  pip install -q accelerate deepspeed
+
+workdir: ~/sky_workdir
+
+# Environment variables
+envs:
+  PYTHONUNBUFFERED: "1"
+  NCCL_DEBUG: INFO
+  NCCL_IB_DISABLE: "0"
+  NCCL_NET_GDR_LEVEL: "2"
+
+run: |
+  cd ~/sky_workdir
+  
+  # SkyPilot sets these automatically
+  MACHINE_RANK=${SKYPILOT_NODE_RANK:-0}
+  MAIN_IP=${SKYPILOT_NODE_IPS[0]}
+  
+  echo "Node ${MACHINE_RANK}/8 starting..."
+  echo "Main IP: ${MAIN_IP}"
+  
+  accelerate launch \
+    --config_file examples/qwen_image/model_training/full/accelerate_config_8nodes.yaml \
+    --machine_rank ${MACHINE_RANK} \
+    --main_process_ip ${MAIN_IP} \
+    --main_process_port 29500 \
+    --num_machines 8 \
+    --num_processes 64 \
+    examples/qwen_image/model_training/train.py \
+    --dataset_base_path data/ \
+    --dataset_metadata_path /home/kuan/workspace/repos/DiffSynth-Studio/data/pico-banana-400k/openimages/metadata_sft_clean.csv \
+    --data_file_keys "image,edit_image" \
+    --extra_inputs "edit_image" \
+    --max_pixels 1048576 \
+    --dataset_repeat 1 \
+    --model_id_with_origin_paths "Qwen/Qwen-Image-Edit:transformer/diffusion_pytorch_model*.safetensors,Qwen/Qwen-Image:text_encoder/model*.safetensors,Qwen/Qwen-Image:vae/diffusion_pytorch_model.safetensors" \
+    --learning_rate 1e-5 \
+    --num_epochs 5 \
+    --remove_prefix_in_ckpt "pipe.dit." \
+    --output_path "./models/train/Qwen-Image-Edit-Pico_8nodes" \
+    --trainable_models "dit" \
+    --use_gradient_checkpointing \
+    --dataset_num_workers 8 \
+    --find_unused_parameters \
+    --save_steps 10000
+

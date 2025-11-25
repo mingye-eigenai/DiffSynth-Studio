@@ -14,7 +14,7 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
         model_paths=None, model_id_with_origin_paths=None,
         tokenizer_path=None, processor_path=None,
         trainable_models=None,
-        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
+        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None, lora_fused=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
@@ -27,6 +27,31 @@ class QwenImageTrainingModule(DiffusionTrainingModule):
         tokenizer_config = ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="tokenizer/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         processor_config = ModelConfig(model_id="Qwen/Qwen-Image-Edit", origin_file_pattern="processor/") if processor_path is None else ModelConfig(processor_path)
         self.pipe = QwenImagePipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs, tokenizer_config=tokenizer_config, processor_config=processor_config)
+
+        # Fuse pretrained LoRA into base weights if provided
+        # This allows training a new LoRA on top of an already LoRA-fused model
+        # Example use case: Fine-tuning on top of Lightning LoRA
+        if lora_fused is not None:
+            print(f"Loading and fusing pretrained LoRA from: {lora_fused}")
+            lora_state_dict = load_state_dict(lora_fused)
+            
+            # Check if this is a Lightning LoRA (uses lora_down/lora_up naming)
+            is_lightning_lora = any("lora_down" in k or "lora_up" in k for k in lora_state_dict.keys())
+            
+            if is_lightning_lora:
+                from diffsynth.lora.lightning_lora_loader import LightningLoRALoader
+                lora_loader = LightningLoRALoader(torch_dtype=torch.bfloat16, device="cpu")
+            else:
+                from diffsynth.lora import GeneralLoRALoader
+                lora_loader = GeneralLoRALoader(torch_dtype=torch.bfloat16, device="cpu")
+            
+            if lora_base_model is not None:
+                # Apply LoRA fusion to the specified base model
+                lora_loader.load(getattr(self.pipe, lora_base_model), lora_state_dict, alpha=1.0)
+            else:
+                # Default to dit if no base model specified
+                lora_loader.load(self.pipe.dit, lora_state_dict, alpha=1.0)
+            print("LoRA fused into base weights successfully")
 
         # Training mode
         self.switch_pipe_to_training_mode(
@@ -132,6 +157,7 @@ if __name__ == "__main__":
         lora_target_modules=args.lora_target_modules,
         lora_rank=args.lora_rank,
         lora_checkpoint=args.lora_checkpoint,
+        lora_fused=args.lora_fused,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,

@@ -1,0 +1,28 @@
+Flash Attention Quick Installation Commands
+==========================================
+
+Since you're in the nunchaku environment and have CUDA 12.8, try these commands in order:
+
+1. SIMPLEST - One-line install with CUDA path:
+   CUDA_HOME=/usr/local/cuda-12.8 pip install flash-attn --no-build-isolation
+
+2. If that fails, try with architecture specified:
+   CUDA_HOME=/usr/local/cuda-12.8 TORCH_CUDA_ARCH_LIST="9.0" pip install flash-attn --no-build-isolation
+
+3. If compilation takes too long or fails, try limiting jobs:
+   CUDA_HOME=/usr/local/cuda-12.8 MAX_JOBS=4 pip install flash-attn --no-build-isolation
+
+4. Alternative - Install from conda-forge:
+   conda install -c conda-forge flash-attn
+
+5. If all else fails, install PyTorch's built-in optimized attention (not as fast but better than nothing):
+   pip install torch>=2.0 --upgrade
+   # Then in your code, PyTorch will use its optimized SDPA
+
+After installation, verify with:
+   python -c "import flash_attn; print(f'Flash Attention {flash_attn.__version__} installed!')"
+
+Then run:
+   python check_setup_status.py
+
+You should see "✅ Flash Attention 3: INSTALLED & WORKING"
