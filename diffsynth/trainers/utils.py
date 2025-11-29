@@ -671,10 +671,11 @@ def launch_training_task(
                 accelerator.backward(loss)
 
                 # Compute gradient norm after backward, before optimizer.step()
-                # Compute on all parameters that have gradients
+                # Only compute on trainable parameters (important for LoRA training)
                 total_grad_norm = 0.0
                 grad_count = 0
-                for param in model.parameters():
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                for param in trainable_params:
                     if param.grad is not None:
                         param_norm = param.grad.detach().data.norm(2)
                         total_grad_norm += param_norm.item() ** 2
@@ -684,7 +685,8 @@ def launch_training_task(
                 # Debug: Check gradient state on first few steps
                 if step_count < 3 and accelerator.is_main_process:
                     total_params = sum(1 for _ in model.parameters())
-                    print(f"\n  [Debug Step {step_count}] {grad_count}/{total_params} params have grads, grad_norm={total_grad_norm:.6f}")
+                    trainable_count = len(trainable_params)
+                    print(f"\n  [Debug Step {step_count}] Trainable: {trainable_count}/{total_params}, With grads: {grad_count}/{trainable_count}, grad_norm={total_grad_norm:.6f}")
 
                 # Periodically verify gradient synchronization (every 100 steps)
                 if step_count % 100 == 0 and accelerator.num_processes > 1:
