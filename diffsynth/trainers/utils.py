@@ -483,10 +483,34 @@ class ModelLogger:
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
+        self.metrics_history = []
+        self.metrics_path = os.path.join(output_path, "training_metrics.json")
 
 
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def log_metrics(self, metrics_dict):
+        """Log metrics to history"""
+        self.metrics_history.append(metrics_dict)
+
+
+    def save_metrics(self):
+        """Save metrics history to JSON file"""
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(self.metrics_path, 'w') as f:
+            json.dump(self.metrics_history, f, indent=2)
+
+
+    def on_step_end(self, accelerator, model, save_steps=None, metrics=None):
         self.num_steps += 1
+
+        # Log metrics if provided
+        if metrics is not None and accelerator.is_main_process:
+            metrics['step'] = self.num_steps
+            self.log_metrics(metrics)
+
+            # Save metrics periodically (every 10 steps) and when saving checkpoints
+            if self.num_steps % 10 == 0 or (save_steps is not None and self.num_steps % save_steps == 0):
+                self.save_metrics()
+
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
@@ -501,10 +525,17 @@ class ModelLogger:
             path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
             accelerator.save(state_dict, path, safe_serialization=True)
 
+            # Save metrics at epoch end
+            self.save_metrics()
+
 
     def on_training_end(self, accelerator, model, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+
+        # Save final metrics
+        if accelerator.is_main_process:
+            self.save_metrics()
 
 
     def save_model(self, accelerator, model, file_name):
@@ -629,15 +660,26 @@ def launch_training_task(
     
     for epoch_id in range(num_epochs):
         step_count = 0
+        epoch_loss_sum = 0.0
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                if dataset.load_from_cache:
+                if hasattr(dataset, 'load_from_cache') and dataset.load_from_cache:
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
                 accelerator.backward(loss)
-                
+
+                # Compute gradient norm across all parameters
+                total_grad_norm = 0.0
+                grad_norm_count = 0
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.data.norm(2).item()
+                        total_grad_norm += param_grad_norm ** 2
+                        grad_norm_count += 1
+                total_grad_norm = total_grad_norm ** 0.5 if grad_norm_count > 0 else 0.0
+
                 # Periodically verify gradient synchronization (every 100 steps)
                 if step_count % 100 == 0 and accelerator.num_processes > 1:
                     # Get first parameter's gradient
@@ -645,19 +687,49 @@ def launch_training_task(
                     if first_param.grad is not None:
                         grad_norm = first_param.grad.norm().item()
                         grad_sum_tensor = torch.tensor([grad_norm]).to(accelerator.device)
-                        
+
                         # All-reduce to check if gradients differ across processes
                         import torch.distributed as dist
                         dist.all_reduce(grad_sum_tensor, op=dist.ReduceOp.SUM)
                         avg_grad_norm = grad_sum_tensor.item() / accelerator.num_processes
-                        
+
                         if accelerator.is_main_process and step_count % 500 == 0:
                             print(f"\n  [Step {step_count}] Gradient sync check: local={grad_norm:.6f}, avg={avg_grad_norm:.6f}")
-                
+
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
+
+                # Gather metrics
+                loss_value = accelerator.gather(loss).mean().item()
+                epoch_loss_sum += loss_value
+                current_lr = optimizer.param_groups[0]['lr']
+
+                metrics = {
+                    'epoch': epoch_id,
+                    'loss': loss_value,
+                    'learning_rate': current_lr,
+                    'gradient_norm': total_grad_norm,
+                }
+
+                # Print metrics periodically
+                if accelerator.is_main_process and (step_count % 10 == 0 or step_count == 0):
+                    print(f"\n  [Epoch {epoch_id}, Step {step_count}] Loss: {loss_value:.6f}, LR: {current_lr:.2e}, Grad Norm: {total_grad_norm:.6f}")
+
+                model_logger.on_step_end(accelerator, model, save_steps, metrics=metrics)
                 scheduler.step()
                 step_count += 1
+
+        # Log epoch-level metrics
+        if accelerator.is_main_process and step_count > 0:
+            avg_epoch_loss = epoch_loss_sum / step_count
+            print(f"\n  [Epoch {epoch_id} Complete] Average Loss: {avg_epoch_loss:.6f}")
+            epoch_metrics = {
+                'epoch': epoch_id,
+                'step': model_logger.num_steps,
+                'average_epoch_loss': avg_epoch_loss,
+                'total_steps_in_epoch': step_count,
+            }
+            model_logger.log_metrics(epoch_metrics)
+
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)

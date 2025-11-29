@@ -1,0 +1,475 @@
+name: qwen-image-lora-pico
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        containers:
+          - volumeMounts:
+              - mountPath: /shared
+                name: nfs-volume
+        volumes:
+          - name: nfs-volume
+            nfs:
+              server: 10.2.9.45
+              path: /srv/nfs/yotta
+              readOnly: false
+
+# ==============================================================================
+# Qwen-Image-Edit LoRA Training with SkyPilot
+# ==============================================================================
+#
+# Directory Structure:
+#   /shared/
+#   ├── base_models/          # Shared base models (family/model)
+#   │   └── Qwen/
+#   │       ├── Qwen-Image-Edit/      # Default edit model
+#   │       ├── Qwen-Image-Edit-2509/ # Alternative edit model
+#   │       └── Qwen-Image/           # Shared components (text_encoder, vae, tokenizer)
+#   ├── dataset/              # User datasets
+#   │   ├── user1_ghost/
+#   │   │   ├── images/
+#   │   │   ├── edit_images/
+#   │   │   └── prompts.txt (optional)
+#   │   └── user2_pico/
+#   │       ├── images/
+#   │       ├── edit_images/
+#   │       └── prompts.txt (optional)
+#   └── output/               # Training outputs
+#
+# Quick Start:
+#   sky launch -c qwen-lora --env DATASET_NAME=user1_ghost skypilot.yaml
+#
+# Use Different Base Model:
+#   sky launch -c qwen-lora \
+#     --env DATASET_NAME=user1_ghost \
+#     --env MODEL_NAME=Qwen-Image-Edit-2509 \
+#     skypilot.yaml
+#
+# Customize Training Parameters:
+#   sky launch -c qwen-lora \
+#     --env DATASET_NAME=user1_ghost \
+#     --env MODEL_NAME=Qwen-Image-Edit-2509 \
+#     --env NUM_EPOCHS=10 \
+#     --env LEARNING_RATE=5e-5 \
+#     --env LORA_RANK=64 \
+#     skypilot.yaml
+#
+# Multi-node Training:
+#   Edit num_nodes below, then launch as above
+#
+# ==============================================================================
+
+# Resource configuration
+resources:
+  cloud: kubernetes  # Change to: aws, gcp, azure, kubernetes
+  accelerators: H100:8  # or A100:8, etc.
+  cpus: 32+
+  memory: 256+
+  disk_size: 500  # GB
+
+# Number of nodes
+num_nodes: 1  # Change to 2, 4, 8 for multi-node training
+
+# Environment setup
+setup: |
+  set -ex
+  echo "=== Setting up DiffSynth-Studio environment ==="
+
+  # Clone from GitHub
+  if [ ! -d ".git" ]; then
+    git clone https://github.com/mingye-eigenai/DiffSynth-Studio.git .
+  fi
+
+  # Install system dependencies (CUDA toolkit for DeepSpeed)
+  # Check if we have sudo access, if not, try to work around
+  if command -v apt-get &> /dev/null; then
+    if sudo -n true 2>/dev/null; then
+      echo "Installing CUDA toolkit..."
+      sudo apt-get update
+      sudo apt-get install -y cuda-nvcc-$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d .) || \
+      sudo apt-get install -y nvidia-cuda-toolkit || \
+      echo "Warning: Could not install CUDA toolkit, DeepSpeed may have limited functionality"
+    fi
+  fi
+
+  # Try to find and set CUDA_HOME
+  if [ -d "/usr/local/cuda" ]; then
+    export CUDA_HOME=/usr/local/cuda
+  elif [ -d "/usr/lib/cuda" ]; then
+    export CUDA_HOME=/usr/lib/cuda
+  elif command -v nvcc &> /dev/null; then
+    export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
+  fi
+
+  if [ -n "$CUDA_HOME" ]; then
+    export PATH=$CUDA_HOME/bin:$PATH
+    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+    echo "CUDA_HOME set to: $CUDA_HOME"
+  fi
+
+  # Install dependencies
+  pip install --upgrade pip setuptools wheel
+  pip install -e .
+  pip install deepspeed>=0.12.0
+  pip install accelerate>=0.25.0
+  pip install peft>=0.7.0
+  pip install pandas
+
+  # Install huggingface-hub CLI (compatible version)
+  pip install "huggingface_hub[cli]<1.0"
+
+  # Optional: Install flash-attention for faster training (recommended)
+  # pip install flash-attn --no-build-isolation
+
+  echo "=== Setup complete ==="
+
+# Environment variables
+envs:
+  # ===== USER CONFIGURABLE TRAINING PARAMETERS =====
+  # Override these when launching: sky launch --env DATASET_NAME=my_dataset --env MODEL_NAME=Qwen-Image-Edit-2509 skypilot.yaml
+  DATASET_NAME: "default"           # Unique dataset name under /shared/dataset/ (REQUIRED)
+  MODEL_FAMILY: "Qwen"              # Model family: Qwen, etc. (default: Qwen)
+  MODEL_NAME: "Qwen-Image-Edit"     # Specific model: Qwen-Image-Edit, Qwen-Image-Edit-2509, etc.
+  NUM_EPOCHS: "5"                   # Number of training epochs (default: 5)
+  LEARNING_RATE: "1e-4"             # Learning rate (default: 1e-4)
+  LORA_RANK: "32"                   # LoRA rank: 8, 16, 32, 64 (default: 32, higher = more parameters)
+  SAVE_STEPS: "3000"                # Save checkpoint every N steps (default: 3000)
+
+  # System environment variables
+  PYTHONUNBUFFERED: "1"
+  NCCL_DEBUG: INFO
+  NCCL_IB_DISABLE: "0"
+  NCCL_NET_GDR_LEVEL: "2"
+  CUDA_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+  OMP_NUM_THREADS: "8"
+  HF_HUB_ENABLE_HF_TRANSFER: "1"
+  TRITON_CACHE_DIR: "/tmp/.triton"
+  DS_BUILD_OPS: "0"
+  DS_SKIP_CUDA_CHECK: "1"
+  CUDA_HOME: "/usr/local/cuda"
+
+# Main training command
+run: |
+  set -ex
+
+  # Pull latest changes
+  git pull
+
+  # Set up CUDA environment for DeepSpeed
+  # Override CUDA_HOME if needed
+  if [ ! -f "$CUDA_HOME/bin/nvcc" ]; then
+    echo "nvcc not found in $CUDA_HOME, searching for CUDA..."
+    if [ -d "/usr/local/cuda" ] && [ -f "/usr/local/cuda/bin/nvcc" ]; then
+      export CUDA_HOME=/usr/local/cuda
+    elif [ -d "/usr/lib/cuda" ] && [ -f "/usr/lib/cuda/bin/nvcc" ]; then
+      export CUDA_HOME=/usr/lib/cuda
+    elif command -v nvcc &> /dev/null; then
+      export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
+    else
+      echo "ERROR: nvcc not found. Installing nvidia-cuda-toolkit..."
+      sudo apt-get update && sudo apt-get install -y nvidia-cuda-toolkit
+      # Try again
+      if command -v nvcc &> /dev/null; then
+        export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
+      fi
+    fi
+  fi
+
+  export PATH=$CUDA_HOME/bin:$PATH
+  export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+  echo "CUDA_HOME: $CUDA_HOME"
+  echo "nvcc version:"
+  nvcc --version || { echo "ERROR: nvcc still not found!"; exit 1; }
+
+  echo "=== Qwen-Image-Edit LoRA Training with Merged QKV ==="
+
+  # ===== CONFIGURATION =====
+  # Dataset paths (each user has their own dataset folder)
+  export DATASET_BASE_PATH="/shared/dataset/${DATASET_NAME}"  # User's unique dataset folder
+  export IMAGE_DIR="${DATASET_BASE_PATH}/images"              # Original images
+  export EDIT_IMAGE_DIR="${DATASET_BASE_PATH}/edit_images"    # Edited images
+  export PROMPT_FILE="${DATASET_BASE_PATH}/prompts.txt"       # Optional: text file with prompts (one per line)
+
+  # Model paths (two-level hierarchy: family/model)
+  export MODEL_BASE_PATH="/shared/base_models/${MODEL_FAMILY}/${MODEL_NAME}"  # Edit model path
+  export BASE_COMPONENTS_PATH="/shared/base_models/${MODEL_FAMILY}/Qwen-Image"  # Base components (text_encoder, vae, tokenizer)
+
+  # Output paths (unique per user and training run)
+  export OUTPUT_PATH="/shared/output/${DATASET_NAME}_${MODEL_NAME}_lora_rank${LORA_RANK}_${NUM_EPOCHS}epochs"
+  export METADATA_PATH="/shared/metadata/${DATASET_NAME}_metadata.csv"
+
+  # Create output directories
+  mkdir -p /shared/output
+  mkdir -p /shared/metadata
+
+  # Training parameters (from environment variables)
+  echo "===================================================="
+  echo "Training Configuration:"
+  echo "  - Dataset Name: ${DATASET_NAME}"
+  echo "  - Dataset Path: ${DATASET_BASE_PATH}"
+  echo "  - Metadata Path: ${METADATA_PATH}"
+  echo "  - Model Family: ${MODEL_FAMILY}"
+  echo "  - Model Name: ${MODEL_NAME}"
+  echo "  - Edit Model Path: ${MODEL_BASE_PATH}"
+  echo "  - Base Components Path: ${BASE_COMPONENTS_PATH}"
+  echo "  - Learning Rate: ${LEARNING_RATE}"
+  echo "  - Number of Epochs: ${NUM_EPOCHS}"
+  echo "  - LoRA Rank: ${LORA_RANK}"
+  echo "  - Save Steps: ${SAVE_STEPS}"
+  echo "  - Output Path: ${OUTPUT_PATH}"
+  echo "===================================================="
+
+  # ===== STEP 1: VALIDATE DATASET EXISTS =====
+  echo "=== Step 1: Validating dataset exists ==="
+
+  if [ ! -d "${DATASET_BASE_PATH}" ]; then
+    echo "ERROR: Dataset base path does not exist: ${DATASET_BASE_PATH}"
+    echo "Available datasets in /shared/dataset/:"
+    ls -la /shared/dataset/ 2>/dev/null || echo "  /shared/dataset/ directory not found"
+    exit 1
+  fi
+
+  if [ ! -d "${IMAGE_DIR}" ]; then
+    echo "ERROR: Images directory does not exist: ${IMAGE_DIR}"
+    echo "Contents of ${DATASET_BASE_PATH}:"
+    ls -la ${DATASET_BASE_PATH}
+    exit 1
+  fi
+
+  if [ ! -d "${EDIT_IMAGE_DIR}" ]; then
+    echo "ERROR: Edit images directory does not exist: ${EDIT_IMAGE_DIR}"
+    echo "Contents of ${DATASET_BASE_PATH}:"
+    ls -la ${DATASET_BASE_PATH}
+    exit 1
+  fi
+
+  echo "✓ Dataset validated successfully"
+  echo "  - Dataset path: ${DATASET_BASE_PATH}"
+  echo "  - Images: $(ls ${IMAGE_DIR} | wc -l) files"
+  echo "  - Edit images: $(ls ${EDIT_IMAGE_DIR} | wc -l) files"
+
+  # ===== STEP 2: GENERATE METADATA.CSV =====
+  echo ""
+  echo "=== Step 2: Generating metadata.csv ==="
+
+  python - <<'EOF'
+  import os
+  import pandas as pd
+  from pathlib import Path
+  import sys
+
+  # Configuration
+  image_dir = os.environ.get('IMAGE_DIR', '/shared/dataset/images')
+  edit_image_dir = os.environ.get('EDIT_IMAGE_DIR', '/shared/dataset/edit_images')
+  prompt_file = os.environ.get('PROMPT_FILE', '/shared/dataset/prompts.txt')
+  metadata_path = os.environ.get('METADATA_PATH', '/shared/metadata.csv')
+  dataset_base_path = os.environ.get('DATASET_BASE_PATH', '/shared/dataset')
+
+  print(f"Scanning dataset at: {dataset_base_path}")
+  print(f"  - Images: {image_dir}")
+  print(f"  - Edited images: {edit_image_dir}")
+  print(f"  - Prompts: {prompt_file}")
+
+  # Collect image pairs
+  data = []
+
+  # Get all images in both directories
+  if os.path.exists(image_dir) and os.path.exists(edit_image_dir):
+      image_files = sorted([f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+      edit_image_files = sorted([f for f in os.listdir(edit_image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+      print(f"Found {len(image_files)} images in {image_dir}")
+      print(f"Found {len(edit_image_files)} edit images in {edit_image_dir}")
+
+      # Show first few filenames for debugging
+      if image_files:
+          print(f"Sample images: {image_files[:3]}")
+      if edit_image_files:
+          print(f"Sample edit_images: {edit_image_files[:3]}")
+
+      # Load prompts if available
+      prompts = []
+      if os.path.exists(prompt_file):
+          with open(prompt_file, 'r') as f:
+              prompts = [line.strip() for line in f if line.strip()]
+          print(f"Loaded {len(prompts)} prompts from {prompt_file}")
+
+      # Create mappings of base name (without extension) to full filename
+      image_map = {Path(f).stem: f for f in image_files}
+      edit_image_map = {Path(f).stem: f for f in edit_image_files}
+
+      # Match images by base name (without extension)
+      common_stems = set(image_map.keys()) & set(edit_image_map.keys())
+      print(f"Found {len(common_stems)} matching image pairs (matched by filename without extension)")
+
+      if len(common_stems) == 0 and len(image_files) > 0 and len(edit_image_files) > 0:
+          print("\nWARNING: No matching filenames found between images and edit_images!")
+          print("Files must have the same base name (extension can differ).")
+          print(f"Example from images/: {image_files[0] if image_files else 'N/A'}")
+          print(f"Example from edit_images/: {edit_image_files[0] if edit_image_files else 'N/A'}")
+
+      for idx, stem in enumerate(sorted(common_stems)):
+          image_filename = image_map[stem]
+          edit_image_filename = edit_image_map[stem]
+          image_path = os.path.join(image_dir, image_filename)
+          edit_image_path = os.path.join(edit_image_dir, edit_image_filename)
+
+          # Use provided prompt or generate a default one
+          if prompts and idx < len(prompts):
+              prompt = prompts[idx]
+          else:
+              # Default prompt - user should provide better prompts
+              prompt = f"Edit the image with style transfer"
+
+          data.append({
+              'image': image_path,
+              'edit_image': edit_image_path,
+              'prompt': prompt
+          })
+  else:
+      print(f"ERROR: Dataset directories not found!")
+      print(f"  - Image dir exists: {os.path.exists(image_dir)}")
+      print(f"  - Edit image dir exists: {os.path.exists(edit_image_dir)}")
+      sys.exit(1)
+
+  # Create DataFrame and save
+  df = pd.DataFrame(data)
+  print(f"\nCreating metadata with {len(df)} samples")
+  print(f"Columns: {list(df.columns)}")
+  print(f"\nFirst few rows:")
+  print(df.head())
+
+  # Save to CSV
+  df.to_csv(metadata_path, index=False)
+  print(f"\nMetadata saved to: {metadata_path}")
+  print(f"Total samples: {len(df)}")
+
+  EOF
+
+  # Verify metadata was created
+  if [ ! -f "${METADATA_PATH}" ]; then
+    echo "ERROR: Failed to create metadata.csv"
+    exit 1
+  fi
+
+  echo "✓ Metadata created successfully!"
+  echo "Preview:"
+  head -n 5 ${METADATA_PATH}
+
+  # ===== STEP 3: DOWNLOAD MODELS (if not present) =====
+  echo ""
+  echo "=== Step 3: Checking base models ==="
+
+  # Create base model directories
+  mkdir -p /shared/base_models/${MODEL_FAMILY}
+
+  # Download edit model (transformer and processor) if not present
+  if [ ! -d "${MODEL_BASE_PATH}" ]; then
+    echo "Downloading ${MODEL_NAME} to ${MODEL_BASE_PATH}..."
+
+    huggingface-cli download ${MODEL_FAMILY}/${MODEL_NAME} \
+      --local-dir ${MODEL_BASE_PATH} \
+      --include "transformer/*" "processor/*"
+
+    echo "${MODEL_NAME} downloaded successfully!"
+  else
+    echo "${MODEL_NAME} already exists at ${MODEL_BASE_PATH}"
+  fi
+
+  # Download base components (text_encoder, vae, tokenizer) if not present
+  if [ ! -d "${BASE_COMPONENTS_PATH}" ]; then
+    echo "Downloading Qwen-Image base components to ${BASE_COMPONENTS_PATH}..."
+
+    huggingface-cli download ${MODEL_FAMILY}/Qwen-Image \
+      --local-dir ${BASE_COMPONENTS_PATH} \
+      --include "text_encoder/*" "vae/*" "tokenizer/*"
+
+    echo "Base components downloaded successfully!"
+  else
+    echo "Base components already exist at ${BASE_COMPONENTS_PATH}"
+  fi
+
+  echo ""
+  echo "Model structure:"
+  echo "  - Edit Model: ${MODEL_BASE_PATH}"
+  echo "  - Base Components: ${BASE_COMPONENTS_PATH}"
+
+  # ===== STEP 4: TRAINING =====
+  echo ""
+  echo "=== Step 4: Starting training ==="
+
+  # Single node training
+  if [ ${SKYPILOT_NUM_NODES:-1} -eq 1 ]; then
+    echo "Running single-node training with $(nvidia-smi --list-gpus | wc -l) GPUs..."
+
+    accelerate launch \
+      --config_file examples/qwen_image/model_training/full/accelerate_config.yaml \
+      examples/qwen_image/model_training/train_merged_qkv.py \
+      --dataset_base_path ${DATASET_BASE_PATH} \
+      --dataset_metadata_path ${METADATA_PATH} \
+      --data_file_keys "image,edit_image" \
+      --extra_inputs "edit_image" \
+      --max_pixels 1048576 \
+      --dataset_repeat 1 \
+      --model_paths "[\"${MODEL_BASE_PATH}/transformer/diffusion_pytorch_model*.safetensors\",\"${BASE_COMPONENTS_PATH}/text_encoder/model*.safetensors\",\"${BASE_COMPONENTS_PATH}/vae/diffusion_pytorch_model.safetensors\"]" \
+      --tokenizer_path "${BASE_COMPONENTS_PATH}/tokenizer" \
+      --processor_path "${MODEL_BASE_PATH}/processor" \
+      --learning_rate ${LEARNING_RATE} \
+      --num_epochs ${NUM_EPOCHS} \
+      --remove_prefix_in_ckpt "pipe.dit." \
+      --output_path ${OUTPUT_PATH} \
+      --lora_base_model "dit" \
+      --lora_target_modules "to_qkv,add_qkv_proj,to_out.0,to_add_out,img_mlp.net.0.proj,img_mlp.net.2,txt_mlp.net.0.proj,txt_mlp.net.2" \
+      --lora_rank ${LORA_RANK} \
+      --use_gradient_checkpointing \
+      --dataset_num_workers 8 \
+      --find_unused_parameters \
+      --save_steps ${SAVE_STEPS}
+
+  # Multi-node training
+  else
+    MACHINE_RANK=${SKYPILOT_NODE_RANK:-0}
+    MAIN_IP=${SKYPILOT_NODE_IPS[0]}
+    NUM_NODES=${SKYPILOT_NUM_NODES:-1}
+    NUM_GPUS_PER_NODE=8
+    TOTAL_GPUS=$((NUM_NODES * NUM_GPUS_PER_NODE))
+
+    echo "Running multi-node training:"
+    echo "  - Node: ${MACHINE_RANK}/${NUM_NODES}"
+    echo "  - Main IP: ${MAIN_IP}"
+    echo "  - Total GPUs: ${TOTAL_GPUS}"
+
+    accelerate launch \
+      --config_file examples/qwen_image/model_training/full/accelerate_config_8nodes.yaml \
+      --machine_rank ${MACHINE_RANK} \
+      --main_process_ip ${MAIN_IP} \
+      --main_process_port 29500 \
+      --num_machines ${NUM_NODES} \
+      --num_processes ${TOTAL_GPUS} \
+      examples/qwen_image/model_training/train_merged_qkv.py \
+      --dataset_base_path ${DATASET_BASE_PATH} \
+      --dataset_metadata_path ${METADATA_PATH} \
+      --data_file_keys "image,edit_image" \
+      --extra_inputs "edit_image" \
+      --max_pixels 1048576 \
+      --dataset_repeat 1 \
+      --model_paths "[\"${MODEL_BASE_PATH}/transformer/diffusion_pytorch_model*.safetensors\",\"${BASE_COMPONENTS_PATH}/text_encoder/model*.safetensors\",\"${BASE_COMPONENTS_PATH}/vae/diffusion_pytorch_model.safetensors\"]" \
+      --tokenizer_path "${BASE_COMPONENTS_PATH}/tokenizer" \
+      --processor_path "${MODEL_BASE_PATH}/processor" \
+      --learning_rate ${LEARNING_RATE} \
+      --num_epochs ${NUM_EPOCHS} \
+      --remove_prefix_in_ckpt "pipe.dit." \
+      --output_path ${OUTPUT_PATH}_${NUM_NODES}nodes \
+      --lora_base_model "dit" \
+      --lora_target_modules "to_qkv,add_qkv_proj,to_out.0,to_add_out,img_mlp.net.0.proj,img_mlp.net.2,txt_mlp.net.0.proj,txt_mlp.net.2" \
+      --lora_rank ${LORA_RANK} \
+      --use_gradient_checkpointing \
+      --dataset_num_workers 8 \
+      --find_unused_parameters \
+      --save_steps ${SAVE_STEPS}
+  fi
+
+  echo ""
+  echo "=== Training complete! ==="
+  echo "Output saved to: ${OUTPUT_PATH}"
+  ls -lh ${OUTPUT_PATH}
