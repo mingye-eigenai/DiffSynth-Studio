@@ -670,19 +670,24 @@ def launch_training_task(
                     loss = model(data)
                 accelerator.backward(loss)
 
-                # Compute gradient norm using PyTorch utilities (only when gradients are synchronized)
-                # This properly handles gradient accumulation and distributed training
-                if accelerator.sync_gradients:
-                    # Use clip_grad_norm_ with a very large max_norm to just compute the norm without clipping
-                    total_grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1e10)
-                    if isinstance(total_grad_norm, torch.Tensor):
-                        total_grad_norm = total_grad_norm.item()
-                else:
-                    # During gradient accumulation steps, set to 0
-                    total_grad_norm = 0.0
+                # Compute gradient norm after backward, before optimizer.step()
+                # Compute on all parameters that have gradients
+                total_grad_norm = 0.0
+                grad_count = 0
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.detach().data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                        grad_count += 1
+                total_grad_norm = total_grad_norm ** 0.5 if grad_count > 0 else 0.0
+
+                # Debug: Check gradient state on first few steps
+                if step_count < 3 and accelerator.is_main_process:
+                    total_params = sum(1 for _ in model.parameters())
+                    print(f"\n  [Debug Step {step_count}] {grad_count}/{total_params} params have grads, grad_norm={total_grad_norm:.6f}")
 
                 # Periodically verify gradient synchronization (every 100 steps)
-                if step_count % 100 == 0 and accelerator.num_processes > 1 and accelerator.sync_gradients:
+                if step_count % 100 == 0 and accelerator.num_processes > 1:
                     # Get first parameter's gradient
                     first_param = next(model.parameters())
                     if first_param.grad is not None:
